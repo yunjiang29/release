@@ -250,6 +250,8 @@ REGION="$(/tmp/yq r "${CONFIG}" 'platform.aws.region')"
 echo Using region: ${REGION}
 test -n "${REGION}"
 
+echo YUNJIANG: HELLO GROUPG
+
 # Generate working availability zones from the region
 mapfile -t AVAILABILITY_ZONES < <(aws --region "${REGION}" ec2 describe-availability-zones | jq -r '.AvailabilityZones[] | select(.State == "available") | .ZoneName' | sort -u)
 # Generate availability zones with the biggest instance type required
