@@ -112,7 +112,7 @@ jq '.Statement += [{
     "ec2:RunInstances"
   ],
   "Condition": {
-    "Bool": {
+    "Null": {
       "ec2:AssociatePublicIpAddress": "true"
     }
   },

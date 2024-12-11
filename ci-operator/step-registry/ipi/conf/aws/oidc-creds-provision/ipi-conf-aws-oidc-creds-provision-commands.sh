@@ -76,7 +76,7 @@ cat <<EOF > /tmp/scp_patch
       effect: Deny
       resource: '*'
       policyCondition:
-        Bool:
+        Null:
           ec2:AssociatePublicIpAddress: true
 EOF
 
