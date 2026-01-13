@@ -1,0 +1,12 @@
+{
+	"path": "openshift/e2e/aws/dedicated-host/openshift-e2e-aws-dedicated-host-workflow.yaml",
+	"owners": {
+		"approvers": [
+			"patrickdillon",
+			"sadasu",
+			"gpei",
+			"jianlinliu",
+			"yunjiang29"
+		]
+	}
+}
