@@ -16,15 +16,19 @@ REGION="${LEASED_RESOURCE}"
 
 ret=0
 
-ls "$SHARED_DIR"/allocated_dedicated_host_* > /tmp/dh_out_list
+dedicated_host_out="$SHARED_DIR"/dedicated_host.yaml
 
-while IFS= read -r allocated_dh_json; do
-  host_id=$(jq -r '.HostIds[]' "$allocated_dh_json")
+if [ ! -f "$dedicated_host_out" ]; then
+  echo "ERROR: dedicated_host.yaml not found."
+  exit 1
+fi
+
+for host_id in $(yq-v4 e '.[].id' "$dedicated_host_out");
+do
   aws --region "$REGION" ec2 release-hosts --host-ids "$host_id" | tee /tmp/out.json
-
   if [ "$(jq -r '.Unsuccessful|length' /tmp/out.json)" != "0" ]; then
     ret=$((ret+1))
   fi
-done < /tmp/dh_out_list
+done
 
 exit $ret

@@ -1,6 +1,7 @@
 chain:
   as: cucushift-installer-rehearse-aws-ipi-dedicated-host-provision
   steps:
+  - ref: aws-provision-dedicated-host
   - chain: ipi-conf-aws
   - ref: ipi-conf-aws-dedicated-host
   - ref: ipi-conf-aws-usage-info

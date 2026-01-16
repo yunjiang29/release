@@ -4,6 +4,7 @@ workflow:
     env:
       BASE_DOMAIN: qe.devcluster.openshift.com
     pre:
+    - ref: aws-provision-dedicated-host
     - chain: ipi-conf-aws
     - ref: ipi-conf-aws-dedicated-host
     - ref: ipi-conf-aws-usage-info

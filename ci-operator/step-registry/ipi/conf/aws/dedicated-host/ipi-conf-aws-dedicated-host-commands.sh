@@ -7,90 +7,52 @@ set -o pipefail
 export AWS_SHARED_CREDENTIALS_FILE="${CLUSTER_PROFILE_DIR}/.awscred"
 
 CONFIG="${SHARED_DIR}/install-config.yaml"
-REGION=${LEASED_RESOURCE}
-CLUSTER_NAME="${NAMESPACE}-${UNIQUE_HASH}"
 
-zones=$(yq-v4 '.controlPlane.platform.aws.zones'[] "${CONFIG}")
-compute_node_type=$(yq-v4 '.compute[0].platform.aws.type // ""' "${CONFIG}")
-control_plane_node_type=$(yq-v4 '.controlPlane.platform.aws.type // ""' "${CONFIG}")
+dedicated_host_out="$SHARED_DIR"/dedicated_host.yaml
+dedicated_host_az_out="$SHARED_DIR"/dedicated_host_azs.yaml
+dedicated_host_instance_type="$SHARED_DIR"/dedicated_host_instance_type
 
-if [ "$zones" == "" ]; then
-  echo "ERROR: No zones found in install-config.yaml, exit now."
+if [ ! -f "$dedicated_host_out" ] || [ ! -f "$dedicated_host_az_out" ] || [ ! -f "$dedicated_host_instance_type" ]; then
+  echo "ERROR: Required DH configuration files don't exist: $dedicated_host_out or $dedicated_host_az_out or $dedicated_host_instance_type"
   exit 1
 fi
 
-if [ "$compute_node_type" == "" ] || [ "$control_plane_node_type" == "" ]; then
-  echo "ERROR: instance type must be set for compute and control plane nodes."
-  exit 1
-fi
+export dedicated_host_out
+export dedicated_host_az_out
+instance_type=$(<"$SHARED_DIR"/dedicated_host_instance_type)
+export instance_type
 
-if [ "$compute_node_type" != "$control_plane_node_type" ]; then
-  echo "ERROR: compute and control plane instance types must be the same."
-  exit 1
-fi
+echo "Overiding zones to:"
+cat $dedicated_host_az_out
 
+yq-v4 -i eval '.compute[0].platform.aws.zones = load(env(dedicated_host_az_out))' ${CONFIG}
+yq-v4 -i eval '.controlPlane.platform.aws.zones = load(env(dedicated_host_az_out))' ${CONFIG}
 
-PATCH=/tmp/dedicated_host_patch.yaml
-rm -f "$PATCH"
-touch "$PATCH"
+echo "Overiding instance type to:"
+cat $dedicated_host_instance_type
 
-EXPIRATION_DATE=$(date -d '12 hours' --iso=minutes --utc)
-for zone in $zones;
-do
+yq-v4 -i eval '.compute[0].platform.aws.type = env(instance_type)' ${CONFIG}
+yq-v4 -i eval '.controlPlane.platform.aws.type = env(instance_type)' ${CONFIG}
 
-  tag_spec=$(mktemp)
-  cat <<EOF > "$tag_spec"
-[
-  {
-    "ResourceType": "dedicated-host",
-    "Tags": [
-      {"Key": "Name", "Value": "${CLUSTER_NAME}-${zone}"},
-      {"Key": "CI-JOB", "Value": "${JOB_NAME_SAFE}"},
-      {"Key": "expirationDate", "Value": "${EXPIRATION_DATE}"},
-      {"Key": "ci-build-info", "Value": "${BUILD_ID}_${JOB_NAME}"}
-    ]
-  }
-]
-EOF
-
-  echo "Allocating host in $zone ..."
-  out=${SHARED_DIR}/allocated_dedicated_host_${zone}.json
-  aws --region "$REGION" ec2 allocate-hosts \
-    --instance-type "$compute_node_type" \
-    --availability-zone "$zone" \
-    --quantity "1" \
-    --tag-specifications file://${tag_spec} > "$out"
-
-  cat $out
-
-  # PATCH format:
-  # - id: h-0ae4c4056dcfb790e
-  #   zone: us-east-1a
-  # - id: h-09329ee98c6902ca7
-  #   zone: us-east-1d
-  h=$(jq -r '.HostIds[]' "$out") z="$zone" yq-v4 -i eval '. += [{"id": env(h), "zone": env(z)}]' "$PATCH"
-
-done
-
-echo "dedicatedHost PATCH:"
-cat "$PATCH"
+echo "Dedicated Host configuration:"
+cat $dedicated_host_out
 
 if [[ "$AWS_DEDICATED_HOST_APPLY_TO" == *"compute"* ]]; then
-  echo "Patching dedicatedHost on compute node:"
+  echo "Patching dedicatedHost on compute node ..."
   yq-v4 -i eval '.compute[0].platform.aws.hostPlacement.affinity = "DedicatedHost"' ${CONFIG}
-  yq-v4 -i eval '.compute[0].platform.aws.hostPlacement.dedicatedHost = load("/tmp/dedicated_host_patch.yaml")' "$CONFIG"
+  yq-v4 -i eval '.compute[0].platform.aws.hostPlacement.dedicatedHost = load(env(dedicated_host_out))' "$CONFIG"
 fi
 
 if [[ "$AWS_DEDICATED_HOST_APPLY_TO" == *"controlPlane"* ]]; then
-  echo "Patching dedicatedHost on controlPlane node:"
+  echo "Patching dedicatedHost on controlPlane node ..."
   yq-v4 -i eval '.controlPlane.platform.aws.hostPlacement.affinity = "DedicatedHost"' ${CONFIG}
-  yq-v4 -i eval '.controlPlane.platform.aws.hostPlacement.dedicatedHost = load("/tmp/dedicated_host_patch.yaml")' "$CONFIG"
+  yq-v4 -i eval '.controlPlane.platform.aws.hostPlacement.dedicatedHost = load(env(dedicated_host_out))' "$CONFIG"
 fi
 
 if [[ "$AWS_DEDICATED_HOST_APPLY_TO" == *"default"* ]]; then
-  echo "Patching dedicatedHost on defaultMachinePlatform:"
+  echo "Patching dedicatedHost on defaultMachinePlatform ..."
   yq-v4 -i eval '.platform.aws.defaultMachinePlatform.hostPlacement.affinity = "DedicatedHost"' ${CONFIG}
-  yq-v4 -i eval '.platform.aws.defaultMachinePlatform.hostPlacement.dedicatedHost = load("/tmp/dedicated_host_patch.yaml")' "$CONFIG"
+  yq-v4 -i eval '.platform.aws.defaultMachinePlatform.hostPlacement.dedicatedHost = load(env(dedicated_host_out))' "$CONFIG"
 fi
 
 echo "install-config.yaml:"
