@@ -16,19 +16,17 @@ REGION="${LEASED_RESOURCE}"
 
 ret=0
 
-dedicated_host_out="$SHARED_DIR"/dedicated_host.yaml
+dedicated_host_json="$SHARED_DIR"/selected_dedicated_hosts.json
 
-if [ ! -f "$dedicated_host_out" ]; then
-  echo "ERROR: dedicated_host.yaml not found."
+if [ ! -f "$dedicated_host_json" ]; then
+  echo "ERROR: selected_dedicated_hosts.json was not found."
   exit 1
 fi
 
-for host_id in $(yq-v4 e '.[].id' "$dedicated_host_out");
-do
-  aws --region "$REGION" ec2 release-hosts --host-ids "$host_id" | tee /tmp/out.json
-  if [ "$(jq -r '.Unsuccessful|length' /tmp/out.json)" != "0" ]; then
-    ret=$((ret+1))
-  fi
-done
+# shellcheck disable=SC2046
+aws --region "$REGION" ec2 release-hosts --host-ids $(jq -r '[.Hosts[].HostId] | join(" ")'  "$dedicated_host_json") | tee /tmp/out.json
+if [ "$(jq -r '.Unsuccessful|length' /tmp/out.json)" != "0" ]; then
+  ret=$((ret+1))
+fi
 
 exit $ret

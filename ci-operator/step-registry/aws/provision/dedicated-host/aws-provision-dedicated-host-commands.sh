@@ -16,78 +16,207 @@ REGION="${LEASED_RESOURCE}"
 CLUSTER_NAME="${NAMESPACE}-${UNIQUE_HASH}"
 EXPIRATION_DATE=$(date -d '12 hours' --iso=minutes --utc)
 
-if [ "${CONTROL_PLANE_INSTANCE_TYPE}" != "${COMPUTE_NODE_TYPE}" ];then
-  echo "ERROR: CONTROL_PLANE_INSTANCE_TYPE and COMPUTE_NODE_TYPE must be identical."
-  exit 1
+if ((AWS_DH_MINIMUM_HOST_NUMBER > AWS_DH_REQURIED_HOST_NUMBER)); then
+    echo "Error: AWS_DH_MINIMUM_HOST_NUMBER ($AWS_DH_MINIMUM_HOST_NUMBER) cannot be greater than AWS_DH_REQURIED_HOST_NUMBER ($AWS_DH_REQURIED_HOST_NUMBER)"
+    exit 1
 fi
 
-dedicated_host_instance_type="${CONTROL_PLANE_INSTANCE_TYPE:-}"
+# --------------------------------------------------------------
+# Pre-allocated Dedicated Hosts
+# --------------------------------------------------------------
 
-# We just have quotas for a few instance types, so ensure these types meet the requirements.
-if [ "$dedicated_host_instance_type" != "" ]; then
-  
-  case "$dedicated_host_instance_type" in
-    m6i.*|m6a.*|m6g.*)
-        echo "Instance type for Dedicated Host: $dedicated_host_instance_type"
-        ;;
-    *)
-        echo "ERROR: Unsupported instance type $dedicated_host_instance_type for Dedicated Host."
-        echo "Valid instance type family: m6i.*, m6a.* and m6g.*"
-        exit 1
-        ;;
-  esac
-else
-  # random select one
-  declare -a candidate_types
-  if [ "${OCP_ARCH}" == "amd64" ]; then
-    candidate_types=("m6a.xlarge" "m6i.xlarge")
-  elif [ "${OCP_ARCH}" == "arm64" ]; then
-    candidate_types=("m6g.xlarge")
-  fi
-  dedicated_host_instance_type=${candidate_types[$RANDOM % ${#candidate_types[@]}]}
+if [[ "$AWS_DH_PRE_ALLOCATED" != "" ]]; then
+
+    echo "Using pre-allocated Dedicated Host"
+
+    # random order
+    DH_POOL=$(echo "$AWS_DH_PRE_ALLOCATED" | tr ' ' '\n' | shuf | tr '\n' ' ' | sed 's/ $/\n/')
+    for HOST_ID in $DH_POOL;
+    do
+        echo "Checking $HOST_ID ..."
+        aws ec2 describe-hosts --region "$REGION" --host-ids "$HOST_ID" > /tmp/dh.json
+        CURRENT_TYPE=$(jq -r '.Hosts[].HostProperties.InstanceType' /tmp/dh.json)
+        AZ=$(jq -r '.Hosts[].AvailabilityZone' /tmp/dh.json)
+        TYPE_VCPU=$(aws --region "$REGION" ec2 describe-instance-types --instance-types "$CURRENT_TYPE" | jq -r '.InstanceTypes[].VCpuInfo.DefaultVCpus')
+        AvailableVCpus=$(jq -r '.Hosts[].AvailableCapacity.AvailableVCpus')
+
+        # 3 control plane + 3 compute + 1 bootstrap = 7
+        if ((TYPE_VCPU*7 < AvailableVCpus)); then
+            echo "Selected pre-allocated Dedicated Host $HOST_ID"
+            cp /tmp/dh.json "${SHARED_DIR}"/selected_dedicated_hosts.json
+            exit 0
+        fi
+    done
+    # exit directly, as we won't allocate Dedicated Hosts dynamic
+    echo "ERROR: No available pre-allocated Dedicated Host for procisioning cluster."
+    exit 1
 fi
 
-echo "$dedicated_host_instance_type" > "$SHARED_DIR"/dedicated_host_instance_type
+# --------------------------------------------------------------
+# Dynamic allocate Dedicated Hosts
+# --------------------------------------------------------------
 
-successful_allocations=0
-dedicated_host_out="$SHARED_DIR"/dedicated_host.yaml
-dedicated_host_az_out="$SHARED_DIR"/dedicated_host_azs.yaml
+trap 'destroy_allocated_unused_hosts' EXIT TERM
 
+function destroy_allocated_unused_hosts()
+{
+    echo -e "Destroying allocated but not used Dedicated Hosts..."
+    if [ -f "${SHARED_DIR}"/allocated_but_not_used_dedicated_host.txt ]; then
+        while IFS= read -r HOST_ID; do
+            echo "  Releasing host: $HOST_IDS"
+            aws ec2 release-hosts --region "$REGION" --host-ids "$HOST_ID"
+        done < "${SHARED_DIR}"/allocated_but_not_used_dedicated_host.txt
+    fi
+}
 
-if [ -f "${SHARED_DIR}"/vpc_info.json ]; then
-    # BYO-VPC, ensure one DH is available in each AZ
-    echo "BYO-VPC is configured"
-    mapfile -t azs < <(jq -r '.subnets[].az' "${SHARED_DIR}"/vpc_info.json)
-    max_allocations=$(jq -r '[.subnets[].az] | length' "${SHARED_DIR}"/vpc_info.json)
-    min_requirement=$max_allocations
-else
-    mapfile -t azs < <(aws --region "$REGION" ec2 describe-availability-zones --filter Name=zone-type,Values=availability-zone --query 'AvailabilityZones[?State==`available`].ZoneName' | jq -r '.[]')
-    max_allocations=2
-    min_requirement=1
+# Retry function with Full Jitter exponential backoff
+# Reference: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+# Full Jitter provides the best results by selecting a random sleep time between 0 and the exponential backoff cap
+retry_with_backoff()
+{
+    local command="$1"
+    local retry_count=0
+    local exit_code=0
+
+    while [ $retry_count -lt $AWS_DH_MAX_RETRIES ]; do
+        # Execute the command and capture both stdout and stderr
+        local output
+
+        output=$(eval "$command" 2>&1)
+        exit_code=$?
+
+        # Check if command succeeded
+        if [ $exit_code -eq 0 ]; then
+            echo "$output"
+            return 0
+        fi
+
+        # Check if error is retryable (InsufficientHostCapacity)
+        if echo "$output" | grep -q "InsufficientHostCapacity"; then
+            retry_count=$((retry_count + 1))
+
+            if [ $retry_count -ge $AWS_DH_MAX_RETRIES ]; then
+                echo -e "  ✗ Max retries ($AWS_DH_MAX_RETRIES) reached. Last error:" >&2
+                echo "$output" >&2
+                echo "RETRIED:$retry_count"  # Signal that retries occurred
+                return $exit_code
+            fi
+
+            # Calculate exponential backoff with Full Jitter
+            # Formula: sleep = random_between(0, min(AWS_DH_MAX_BACKOFF, AWS_DH_BASE_BACKOFF * 2^attempt))
+            local exp_backoff=$((AWS_DH_BASE_BACKOFF * (2 ** retry_count)))
+            local capped_backoff=$((exp_backoff > AWS_DH_MAX_BACKOFF ? AWS_DH_MAX_BACKOFF : exp_backoff))
+
+            # Generate random jitter between 0 and capped_backoff (Full Jitter)
+            local sleep_time=$((RANDOM % (capped_backoff + 1)))
+
+            echo -e "  ⚠ InsufficientHostCapacity detected. Retry $retry_count/$AWS_DH_MAX_RETRIES after ${sleep_time}s (Full Jitter)..." >&2
+            sleep $sleep_time
+        else
+            # Non-retryable error - return immediately with error details
+            echo "$output" >&2
+            echo "ERROR_TYPE:NON_RETRYABLE"  # Signal that no retries occurred
+            return $exit_code
+        fi
+    done
+
+    return $exit_code
+}
+
+echo -e "=== AWS Dedicated Host Multi-AZ Allocation ==="
+echo "Region: $REGION"
+echo "Candidate Instance Types: $AWS_DH_CANDIDATE_TYPES"
+echo "Minimum Requirement: $AWS_DH_MINIMUM_HOST_NUMBER hosts (same type)"
+if [ -n "$AWS_DH_REQURIED_HOST_NUMBER" ]; then
+    echo "Maximum Allocations: $AWS_DH_REQURIED_HOST_NUMBER hosts"
+fi
+echo "Retry Strategy: Full Jitter (Max retries: $AWS_DH_MAX_RETRIES, Base backoff: ${AWS_DH_BASE_BACKOFF}s, Max backoff: ${AWS_DH_MAX_BACKOFF}s)"
+echo ""
+
+echo -e "Fetching available Availability Zones..."
+AVAILABILITY_ZONES=$(aws ec2 describe-availability-zones \
+    --region "$REGION" \
+    --filters "Name=state,Values=available" "Name=zone-type,Values=availability-zone" \
+    --query 'AvailabilityZones[].ZoneName' \
+    --output text)
+
+if [ -z "$AVAILABILITY_ZONES" ]; then
+    echo -e "Error: No available AZs found in region $REGION"
+    exit 1
 fi
 
-echo "Found ${#azs[@]} availability zones in $REGION: ${azs[*]}"
-echo "Max allocations: $max_allocations Dedicated Hosts"
-echo "Min requirement: $min_requirement Dedicated Hosts"
+echo "Available AZs: $AVAILABILITY_ZONES"
+echo ""
 
-declare -a host_ids
-declare -a host_zones
+HOST_IDS=()
+ALLOCATION_SUMMARY=()
+USED_AZS=()
+REQURIED_REACHED=false  # Flag to stop when AWS_DH_REQURIED_HOST_NUMBER is reached
+MINIMUM_REACHED=false  # Flag to stop when AWS_DH_MINIMUM_HOST_NUMBER is reached
+ALLOCATED_TYPE=""  # Track which instance type was successfully allocated
 
-for zone in "${azs[@]}"; do
-    if [ "$successful_allocations" -ge "$max_allocations" ]; then
-        echo "Successfully allocated $successful_allocations Dedicated Hosts. Exiting."
+# Try each candidate instance type until minimum requirement is met
+for CURRENT_TYPE in $AWS_DH_CANDIDATE_TYPES; do
+    # Stop if minimum requirement already reached
+    if [ "$MINIMUM_REACHED" = true ]; then
         break
     fi
 
-    echo "Attempting to allocate Dedicated Host in $zone..."
+    # ----------------------------------------------------------------------------------------------
+    # Verify instance type availability in each AZ, not all instance types are available in all AZs.
+    # ----------------------------------------------------------------------------------------------
+    echo -e "=== Trying instance type: $CURRENT_TYPE ==="
+    AVAILABLE_AZS="$AVAILABILITY_ZONES" # Reset AZ list for each instance type
+    echo -e "Verifying instance type availability in each AZ..."
+    for AZ in $AVAILABLE_AZS; do
+        AVAILABLE=$(aws ec2 describe-instance-type-offerings \
+            --region "$REGION" \
+            --location-type "availability-zone" \
+            --filters "Name=location,Values=$AZ" "Name=instance-type,Values=$CURRENT_TYPE" \
+            --query 'InstanceTypeOfferings[0].InstanceType' \
+            --output text 2>/dev/null || echo "None")
 
-    tag_spec=$(mktemp)
-    cat <<EOF > "$tag_spec"
+        if [ "$AVAILABLE" = "$CURRENT_TYPE" ]; then
+            echo -e "  ✓ $AZ: $CURRENT_TYPE available"
+        else
+            echo -e "  ✗ $AZ: $CURRENT_TYPE NOT available (skipping)"
+            AVAILABLE_AZS=$(echo "$AVAILABLE_AZS" | sed "s/$AZ//g")
+        fi
+    done
+    echo ""
+
+    # Skip this instance type if not available in any AZ
+    if [ -z "$AVAILABLE_AZS" ]; then
+        echo -e "⚠ $CURRENT_TYPE not available in any AZ, trying next instance type..."
+        echo ""
+        continue
+    fi
+
+    # ----------------------------------------------------------------------------------------------
+    # Allocate hosts across AZs
+    # ----------------------------------------------------------------------------------------------
+    # This provides redundancy and fault tolerance
+    echo -e "Allocating Dedicated Hosts across AZs..."
+
+    for AZ in $AVAILABLE_AZS; do
+        # Stop if requried allocations reached
+        if [ "$REQURIED_REACHED" = true ]; then
+            break
+        fi
+
+        echo -e "Processing: [$AZ] [$CURRENT_TYPE]"
+
+        # Stop if minimum requirement or required allocations reached
+        if [ "$REQURIED_REACHED" = true ]; then
+            break
+        fi
+
+        cat <<EOF > /tmp/tag_spec.json
 [
   {
     "ResourceType": "dedicated-host",
     "Tags": [
-      {"Key": "Name", "Value": "${CLUSTER_NAME}-${zone}"},
+      {"Key": "Name", "Value": "${CLUSTER_NAME}-${AZ}-${CURRENT_TYPE}"},
       {"Key": "CI-JOB", "Value": "${JOB_NAME_SAFE}"},
       {"Key": "expirationDate", "Value": "${EXPIRATION_DATE}"},
       {"Key": "ci-build-info", "Value": "${BUILD_ID}_${JOB_NAME}"}
@@ -95,70 +224,182 @@ for zone in "${azs[@]}"; do
   }
 ]
 EOF
+        ALLOC_CMD="aws ec2 allocate-hosts \
+            --region $REGION \
+            --instance-type $CURRENT_TYPE \
+            --availability-zone $AZ \
+            --auto-placement $AWS_DH_AUTO_PLACEMENT \
+            --host-recovery $AWS_DH_HOST_RECOVERY \
+            --quantity 1 \
+            --tag-specifications file:///tmp/tag_spec.json \
+            --output json"
+        # set +x
 
-    response=$(aws --region "$REGION" ec2 allocate-hosts \
-        --instance-type "$dedicated_host_instance_type" \
-        --availability-zone "$zone" \
-        --tag-specifications file://${tag_spec} \
-        --quantity "1" 2>&1 || true)
+        # exponential backoff, this handles InsufficientHostCapacity errors gracefully
+        RESULT=$(retry_with_backoff "$ALLOC_CMD")
+        exit_code=$?
 
-    echo $response
+        if [ $exit_code -eq 0 ]; then
+            # Filter out the success JSON from any retry messages
+            HOST_ID=$(echo "$RESULT" | grep -v "^RETRIED:" | grep -v "^ERROR_TYPE:" | jq -r '.HostIds[0]')
+            HOST_IDS+=("$HOST_ID")
+            ALLOCATION_SUMMARY+=("$AZ ($CURRENT_TYPE): $HOST_ID")
 
-    host_id=$(echo "$response" | jq -r '.HostIds[0]? // ""' || true)
+            # Track the AZ and host ID for YAML output, store as "HOST_ID:AZ" for later processing
+            USED_AZS+=("$HOST_ID:$AZ")
 
-    if [ -n "$host_id" ]; then
-        host_ids+=("$host_id")
-        host_zones+=("$zone")
-        successful_allocations=$((successful_allocations + 1))
-        echo "Successfully allocated Dedicated Host $host_id in $zone (Total: $successful_allocations/$max_allocations)"
+            ALLOCATED_TYPE="$CURRENT_TYPE"
+            echo -e "  ✓ Allocated: $HOST_ID ($CURRENT_TYPE in $AZ)"
+
+            # Check if minimum requirement reached
+            if [ ${#HOST_IDS[@]} -ge $AWS_DH_MINIMUM_HOST_NUMBER ]; then
+                MINIMUM_REACHED=true
+            fi
+
+            if [ -n "$AWS_DH_REQURIED_HOST_NUMBER" ] && [ ${#HOST_IDS[@]} -ge $AWS_DH_REQURIED_HOST_NUMBER ]; then
+                REQURIED_REACHED=true
+                break  # Exit immediately, will skip remaining AZs and types
+            fi
+        else
+            # Check if retries occurred or if it was a non-retryable error
+            if echo "$RESULT" | grep -q "^ERROR_TYPE:NON_RETRYABLE"; then
+                # Extract the actual error message
+                ERROR_MSG=$(echo "$RESULT" | grep -v "^ERROR_TYPE:" | tail -1)
+
+                # Check for specific error types
+                if echo "$ERROR_MSG" | grep -q "HostLimitExceeded"; then
+                    echo -e "  ✗ Failed: HostLimitExceeded - You have reached your Dedicated Host quota limit"
+                    echo -e "      → Request a quota increase via AWS Service Quotas or try a different instance type"
+                elif echo "$ERROR_MSG" | grep -q "InsufficientHostCapacity"; then
+                    echo -e "  ✗ Failed: InsufficientHostCapacity - No capacity available"
+                else
+                    echo -e "  ✗ Failed to allocate host in $AZ"
+                fi
+            else
+                # Retries occurred (InsufficientHostCapacity)
+                echo -e "  ✗ Failed to allocate host in $AZ after $AWS_DH_MAX_RETRIES retries (InsufficientHostCapacity)"
+            fi
+            # Continue with other AZs instead of failing completely
+        fi
+
+        # Check if AWS_DH_MINIMUM_HOST_NUMBER or AWS_DH_REQURIED_HOST_NUMBER was reached during this AZ's allocation
+        if [ "$REQURIED_REACHED" = true ]; then
+            echo ""
+            break  # Exit AZ loop immediately
+        fi
+
+        echo ""
+    done
+
+    # Check if minimum requirement is met
+    echo -e "Current total: ${#HOST_IDS[@]} hosts allocated (type: ${ALLOCATED_TYPE})"
+
+    if [ "$REQURIED_REACHED" = true ]; then
+        echo -e "✓ Requried $AWS_DH_REQURIED_HOST_NUMBER hosts met (all from $ALLOCATED_TYPE)!"
+        echo ""
+        break # Exit instance type loop immediately
+    fi
+    
+    if [ "$MINIMUM_REACHED" = true ]; then
+        echo -e "✓ Minimum requirement of $AWS_DH_MINIMUM_HOST_NUMBER hosts met (all from $ALLOCATED_TYPE)!"
+        echo ""
     else
-        echo "Failed to allocate Dedicated Host in $zone. Trying next AZ..."
-        echo "$response" | grep -i "error" || true
+        echo -e "⚠ Need at least $AWS_DH_MINIMUM_HOST_NUMBER hosts from same type, trying next instance type..."
+        echo ""
+
+        # Save host info for destroying
+        echo "Saving allocated but not used host info for cleanup..."
+        for HOST_ID in "${HOST_IDS[@]}"; do
+            echo "$HOST_ID" >> "${SHARED_DIR}"/allocated_but_not_used_dedicated_host.txt
+        done
+
+        # Reset for next instance type attempt (including both flags)
+        HOST_IDS=()
+        ALLOCATION_SUMMARY=()
+        USED_AZS=()
+        ALLOCATED_TYPE=""
+        REQURIED_REACHED=false
+        MINIMUM_REACHED=false
     fi
 done
 
-# Create patch for install-config.yaml
-if [ "$successful_allocations" -gt 0 ]; then
+# EXIT if no hosts allocated
+if [ ${#HOST_IDS[@]} -eq 0 ]; then
+    echo -e "=== Error: No hosts were successfully allocated ==="
+    exit 1
+fi
 
-    # Initialize empty YAML array
-    echo "[]" | yq-v4 eval '.' > "$dedicated_host_out"
+if [ "$MINIMUM_REACHED" != true ]; then
+    echo -e "=== Error: Minimum requirement not met ==="
+    echo "Allocated ${#HOST_IDS[@]} hosts, but minimum requirement is $AWS_DH_MINIMUM_HOST_NUMBER (same type)"
+    echo "All candidate instance types have been exhausted."
+    echo ""
+    exit 1
+fi
 
-    # Dedicate Host
-    #
-    # Format:
-    # - id: h-01ebe7dd847bff5b3
-    #   zone: us-west-1a
-    # - id: h-014e3c9b07eaf2d0c
-    #   zone: us-west-1c
-    for i in "${!host_ids[@]}"; do
-        yq-v4 eval ".[$i].id = \"${host_ids[$i]}\"" -i "$dedicated_host_out"
-        yq-v4 eval ".[$i].zone = \"${host_zones[$i]}\"" -i "$dedicated_host_out"
+echo -e "Waiting for hosts to become available..."
+MAX_WAIT=300  # 5 minutes
+ELAPSED=0
+
+while [ $ELAPSED -lt $MAX_WAIT ]; do
+    ALL_AVAILABLE=true
+
+    for HOST_ID in "${HOST_IDS[@]}"; do
+        STATE=$(aws ec2 describe-hosts \
+            --region "$REGION" \
+            --host-ids "$HOST_ID" \
+            --query 'Hosts[0].State' \
+            --output text)
+
+        if [ "$STATE" != "available" ]; then
+            ALL_AVAILABLE=false
+            break
+        fi
     done
 
-    echo "Dedicate Host:"
-    cat "$dedicated_host_out"
+    if [ "$ALL_AVAILABLE" = true ]; then
+        echo -e "All hosts are available!"
+        break
+    fi
 
-    # AZs
-    # Format:
-    # - us-west-1a
-    # - us-west-1c
-    echo "[]" | yq-v4 eval '.' > "$dedicated_host_az_out"
+    echo "  Waiting... ($ELAPSED seconds elapsed)"
+    sleep 10
+    ELAPSED=$((ELAPSED + 10))
+done
 
-    for i in "${!host_zones[@]}"; do
-        yq-v4 eval ".[$i] = \"${host_zones[$i]}\"" -i "$dedicated_host_az_out"
-    done
-
-    echo "AZs:"
-    cat "$dedicated_host_az_out"
+# EXIT if not all hosts are ready
+if [ $ELAPSED -ge $MAX_WAIT ]; then
+    echo -e "ERROR: Timeout waiting for hosts to become available"
+    exit 1
 fi
 
 echo ""
-if [ "$successful_allocations" -lt "$min_requirement" ]; then
-    echo "Error: The minimum DH requirement is $min_requirement, but we only got $successful_allocations DHs."
-    exit 1
+echo -e "=== Allocation Summary ==="
+echo "Total hosts allocated: ${#HOST_IDS[@]}"
+echo ""
+if [ ${#ALLOCATION_SUMMARY[@]} -gt 0 ]; then
+    for SUMMARY in "${ALLOCATION_SUMMARY[@]}"; do
+        echo "  $SUMMARY"
+    done
 else
-    echo "Success: $successful_allocations Dedicated Hosts allocated successfully!"
-    exit 0
+    echo "  No hosts were successfully allocated"
+fi
+echo ""
+
+# Output host details
+if [ ${#HOST_IDS[@]} -gt 0 ]; then
+    echo -e "Detailed host information..."
+    echo ""
+
+    aws ec2 describe-hosts \
+        --region "$REGION" \
+        --host-ids "${HOST_IDS[@]}" \
+        --output json > ${SHARED_DIR}/selected_dedicated_hosts.json
+    
+    jq -r '.Hosts[] |
+            "Name: " + (((.Tags // [] | map(select(.Key == "Name")) | .[0].Value) // "N/A")) +
+            " | Host: \(.HostId) | AZ: \(.AvailabilityZone) | Type: \(.HostProperties.InstanceType)" +
+            " | State: \(.State) | AvailableVCpus: \(.AvailableCapacity.AvailableVCpus)"' ${SHARED_DIR}/selected_dedicated_hosts.json
 fi
 
-
+echo ""

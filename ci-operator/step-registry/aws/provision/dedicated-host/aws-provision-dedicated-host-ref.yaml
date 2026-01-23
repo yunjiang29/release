@@ -11,19 +11,41 @@ ref:
       cpu: 10m
       memory: 100Mi
   env:
-  - name: CONTROL_PLANE_INSTANCE_TYPE
+  - name: AWS_DH_PRE_ALLOCATED
     default: ""
     documentation: |-
-      For Dedicate Host, it must be in m6i, m6g, m6a family
-      Or leave it empty the script will decide which one should be used
-  - name: COMPUTE_NODE_TYPE
-    default: ""
+      If not empty, will select 1 DH from this pool
+      Seperated by space.
+  - name: AWS_DH_REQURIED_HOST_NUMBER
+    default: "2"
     documentation: |-
-      For Dedicate Host, it must be in m6i, m6g, m6a family
-      Or leave it empty the script will decide which one should be used
-  - name: OCP_ARCH
-    default: "amd64"
+      Required host number.
+  - name: AWS_DH_MINIMUM_HOST_NUMBER
+    default: "1"
     documentation: |-
-      The architecture of the control plane nodes (e.g., amd64, arm64).
+      If can not allocate AWS_DH_REQURIED_HOST_NUMBER hosts, AWS_DH_MINIMUM_HOST_NUMBER is also acceptable (same type)
+  - name: AWS_DH_CANDIDATE_TYPES
+    default: "m6a.xlarge m6a.2xlarge m6a.4xlarge m6i.xlarge m6i.2xlarge m6i.4xlarge"
+    documentation: |-
+      Candidate instance types to try (in order of preference) to allocate DH
+  - name: AWS_DH_AUTO_PLACEMENT
+    default: "on"
+  - name: AWS_DH_HOST_RECOVERY
+    default: "on"
+  - name: AWS_DH_MAX_RETRIES
+    default: "10"
+    documentation: |-
+      Retry Configuration (for InsufficientHostCapacity errors)
+      Maximum number of retry attempts
+  - name: AWS_DH_BASE_BACKOFF
+    default: "1"
+    documentation: |-
+      Retry Configuration (for InsufficientHostCapacity errors)
+      Base backoff time in seconds
+  - name: AWS_DH_MAX_BACKOFF
+    default: "300"
+    documentation: |-
+      Retry Configuration (for InsufficientHostCapacity errors)
+      Maximum backoff time in seconds (5 minutes)
   documentation: >-
-    Release AWS Dedicated Hosts.
+    Allocate AWS Dedicated Hosts.

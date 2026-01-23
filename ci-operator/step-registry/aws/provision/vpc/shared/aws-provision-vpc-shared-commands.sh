@@ -757,6 +757,12 @@ if [[ "${ADDITIONAL_SUBNETS_COUNT}" -gt 0 ]]; then
   aws_add_param_to_json "AdditionalSubnetsCount" ${ADDITIONAL_SUBNETS_COUNT} "$vpc_params"
 fi
 
+# For AWS Dedicated Host
+if [ -f ${SHARED_DIR}/selected_dedicated_hosts.json ]; then
+  echo "Getting zones from AWS Dedicated Hosts file: selected_dedicated_hosts.json"
+  ZONES_LIST="$(jq -r '[.Hosts[].AvailabilityZone] | join(",")' ${SHARED_DIR}/selected_dedicated_hosts.json)"
+fi
+
 # Enable support for AWS EFS CSI driver in single-zone, cross-account configuration.
 # This condition is used by the chain: storage-conf-csi-optional-aws-efs-cross-account.
 # It ensures that both the cluster and the shared VPC subnet are in the same availability zone.

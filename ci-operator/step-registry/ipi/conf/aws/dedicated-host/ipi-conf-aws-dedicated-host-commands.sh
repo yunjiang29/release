@@ -7,19 +7,28 @@ set -o pipefail
 export AWS_SHARED_CREDENTIALS_FILE="${CLUSTER_PROFILE_DIR}/.awscred"
 
 CONFIG="${SHARED_DIR}/install-config.yaml"
+dedicated_hosts_info=${SHARED_DIR}/selected_dedicated_hosts.json
 
-dedicated_host_out="$SHARED_DIR"/dedicated_host.yaml
-dedicated_host_az_out="$SHARED_DIR"/dedicated_host_azs.yaml
-dedicated_host_instance_type="$SHARED_DIR"/dedicated_host_instance_type
-
-if [ ! -f "$dedicated_host_out" ] || [ ! -f "$dedicated_host_az_out" ] || [ ! -f "$dedicated_host_instance_type" ]; then
-  echo "ERROR: Required DH configuration files don't exist: $dedicated_host_out or $dedicated_host_az_out or $dedicated_host_instance_type"
+if [ ! -f "$dedicated_hosts_info" ]; then
+  echo "ERROR: Required DH configuration files don't exist: $dedicated_hosts_info"
   exit 1
 fi
 
+dedicated_host_out=/tmp/ic_dh.yaml
+jq -r '.Hosts[] | "- id: \(.HostId)\n  zone: \(.AvailabilityZone)"' "$dedicated_hosts_info" > "$dedicated_host_out"
+
+dedicated_host_az_out=/tmp/ic_dh_az.yaml
+jq -r '.Hosts[] | "- \(.AvailabilityZone)"' "$dedicated_hosts_info" > "$dedicated_host_az_out"
+
+echo "======================================================================"
+echo "WARNINNG: AWS Dedicated Host will overide the following configuration:"
+echo "platform.aws.zones for compute and controlPlane"
+echo "platform.aws.type for compute and controlPlane"
+echo "======================================================================"
+
 export dedicated_host_out
 export dedicated_host_az_out
-instance_type=$(<"$SHARED_DIR"/dedicated_host_instance_type)
+instance_type=$(jq -r '.Hosts[0].HostProperties.InstanceType' "$dedicated_hosts_info")
 export instance_type
 
 echo "Overiding zones to:"
@@ -28,8 +37,7 @@ cat $dedicated_host_az_out
 yq-v4 -i eval '.compute[0].platform.aws.zones = load(env(dedicated_host_az_out))' ${CONFIG}
 yq-v4 -i eval '.controlPlane.platform.aws.zones = load(env(dedicated_host_az_out))' ${CONFIG}
 
-echo "Overiding instance type to:"
-cat $dedicated_host_instance_type
+echo "Overiding instance type to $instance_type"
 
 yq-v4 -i eval '.compute[0].platform.aws.type = env(instance_type)' ${CONFIG}
 yq-v4 -i eval '.controlPlane.platform.aws.type = env(instance_type)' ${CONFIG}

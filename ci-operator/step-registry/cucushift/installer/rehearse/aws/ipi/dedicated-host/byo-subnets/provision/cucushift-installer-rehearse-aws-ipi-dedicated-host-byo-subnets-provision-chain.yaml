@@ -1,8 +1,8 @@
 chain:
   as: cucushift-installer-rehearse-aws-ipi-dedicated-host-byo-subnets-provision
   steps:
-  - ref: aws-provision-vpc-shared
   - ref: aws-provision-dedicated-host
+  - ref: aws-provision-vpc-shared
   - chain: ipi-conf-aws
   - ref: aws-provision-security-group
   - ref: ipi-conf-aws-custom-vpc
