@@ -732,6 +732,13 @@ if [[ "${ZONES_COUNT}" -gt 3 ]]; then
   ZONES_COUNT=3
 fi
 
+# For AWS Dedicated Host
+if [ -f ${SHARED_DIR}/selected_dedicated_hosts.json ]; then
+  echo "Getting zones from AWS Dedicated Hosts file: selected_dedicated_hosts.json"
+  ZONES_LIST="$(jq -r '[.Hosts[].AvailabilityZone] | join(",")' ${SHARED_DIR}/selected_dedicated_hosts.json)"
+  ZONES_COUNT=$(echo "$ZONES_LIST" | awk -F',' '{ print NF }')
+fi
+
 STACK_NAME="${NAMESPACE}-${UNIQUE_HASH}-vpc"
 if [[ ${ENABLE_SHARED_VPC} == "yes" ]]; then
   echo ${STACK_NAME} >> "${SHARED_DIR}/to_be_removed_cf_stack_list_shared_account"
@@ -755,12 +762,6 @@ fi
 
 if [[ "${ADDITIONAL_SUBNETS_COUNT}" -gt 0 ]]; then
   aws_add_param_to_json "AdditionalSubnetsCount" ${ADDITIONAL_SUBNETS_COUNT} "$vpc_params"
-fi
-
-# For AWS Dedicated Host
-if [ -f ${SHARED_DIR}/selected_dedicated_hosts.json ]; then
-  echo "Getting zones from AWS Dedicated Hosts file: selected_dedicated_hosts.json"
-  ZONES_LIST="$(jq -r '[.Hosts[].AvailabilityZone] | join(",")' ${SHARED_DIR}/selected_dedicated_hosts.json)"
 fi
 
 # Enable support for AWS EFS CSI driver in single-zone, cross-account configuration.

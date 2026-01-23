@@ -38,10 +38,15 @@ if [[ "$AWS_DH_PRE_ALLOCATED" != "" ]]; then
         CURRENT_TYPE=$(jq -r '.Hosts[].HostProperties.InstanceType' /tmp/dh.json)
         AZ=$(jq -r '.Hosts[].AvailabilityZone' /tmp/dh.json)
         TYPE_VCPU=$(aws --region "$REGION" ec2 describe-instance-types --instance-types "$CURRENT_TYPE" | jq -r '.InstanceTypes[].VCpuInfo.DefaultVCpus')
-        AvailableVCpus=$(jq -r '.Hosts[].AvailableCapacity.AvailableVCpus')
+        AVAILABLE_VCPUS=$(jq -r '.Hosts[].AvailableCapacity.AvailableVCpus' /tmp/dh.json)
+
+        echo "Type: $CURRENT_TYPE"
+        echo "AZ: $AZ"
+        echo "TYPE_VCPU: $TYPE_VCPU"
+        echo "AVAILABLE_VCPUS: $AVAILABLE_VCPUS"
 
         # 3 control plane + 3 compute + 1 bootstrap = 7
-        if ((TYPE_VCPU*7 < AvailableVCpus)); then
+        if ((TYPE_VCPU*7 < AVAILABLE_VCPUS)); then
             echo "Selected pre-allocated Dedicated Host $HOST_ID"
             cp /tmp/dh.json "${SHARED_DIR}"/selected_dedicated_hosts.json
             exit 0
@@ -233,9 +238,10 @@ EOF
             --quantity 1 \
             --tag-specifications file:///tmp/tag_spec.json \
             --output json"
-        # set +x
 
         # exponential backoff, this handles InsufficientHostCapacity errors gracefully
+        set +e
+
         RESULT=$(retry_with_backoff "$ALLOC_CMD")
         exit_code=$?
 
@@ -281,6 +287,8 @@ EOF
             fi
             # Continue with other AZs instead of failing completely
         fi
+
+        set -e
 
         # Check if AWS_DH_MINIMUM_HOST_NUMBER or AWS_DH_REQURIED_HOST_NUMBER was reached during this AZ's allocation
         if [ "$REQURIED_REACHED" = true ]; then
