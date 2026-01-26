@@ -1018,7 +1018,10 @@ tests:
 - as: e2e-aws-ovn-dedicated-host
   cron: '@yearly'
   steps:
-    cluster_profile: aws-qe
+    cluster_profile: aws-2
+    leases:
+    - env: LEASED_RESOURCE
+      resource_type: aws-edge-zones-quota-slice
     observers:
       enable:
       - observers-resource-watch
